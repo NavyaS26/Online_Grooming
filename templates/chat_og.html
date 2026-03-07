@@ -326,11 +326,11 @@
 
 <script>
 const EMOJIS=['😊','😂','❤️','😍','🥺','😭','😘','🥰','😅','🙏','🔥','✨','😁','🎉','💕','😢','👏','🤣','💯','😉','🤔','😎','😜','💪','🎊','👍','😋','🥳','😏','💀','👀','🤩','😤','💬','🫶','🙈','🤗','😬','🫠','👾'];
-const BOT_REPLIES=['That sounds really uncomfortable. You haven\'t done anything wrong at all 💛','I\'m really glad you told me. Can you tell me a bit more about what happened?','You\'re so brave for sharing this. What they\'re doing is NOT okay.','You don\'t have to deal with this alone. I\'m right here with you 🤗','Thank you for trusting me. It\'s important you feel safe.','This is never your fault. You did the right thing by speaking up.','If you feel unsafe, please call CHILDLINE 1098 — free and private 💚','You\'re not in trouble. The person making you uncomfortable is the problem, not you.'];
+const supportHistory=[];
 
 // State
 let myName='', myAvatar='🐼', mySid=null, myRole=null;
-let pendingImg=null, emojiOpen=false, typingTmt=null, popupShown=false, botIdx=0;
+let pendingImg=null, emojiOpen=false, typingTmt=null, popupShown=false;
 
 // Elements
 const usernameScreen=document.getElementById('username-screen');
@@ -429,7 +429,6 @@ socket.on('sandbox_activated',data=>{
   if(myRole!=='child') return;
   updateRiskBar(data.risk,data.stage);
   showPopup();
-  addSys('🛡 SafeGuard is now protecting this conversation');
 });
 
 socket.on('chat_terminated',data=>{
@@ -625,18 +624,36 @@ document.getElementById('cb-close').addEventListener('click',()=>{
 });
 document.getElementById('cb-send').addEventListener('click',sendBotMsg);
 document.getElementById('cb-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendBotMsg();});
+function appendBotMsg(text,isUser){
+  const msgs=document.getElementById('cb-msgs');
+  const d=document.createElement('div');
+  d.className=isUser?'cb-user':'cb-bot';
+  d.textContent=text;
+  msgs.appendChild(d);
+  msgs.scrollTop=msgs.scrollHeight;
+}
+function showBotTyping(){
+  const msgs=document.getElementById('cb-msgs');
+  const d=document.createElement('div');
+  d.className='cb-bot';d.id='cb-typing';d.textContent='💚 typing…';
+  msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
+}
+function removeBotTyping(){
+  const t=document.getElementById('cb-typing');if(t)t.remove();
+}
+socket.on('support_reply',data=>{
+  removeBotTyping();
+  appendBotMsg(data.text,false);
+  supportHistory.push({role:'counsellor',text:data.text});
+});
 function sendBotMsg(){
   const inp=document.getElementById('cb-input');
   const t=inp.value.trim();if(!t)return;
-  const msgs=document.getElementById('cb-msgs');
-  const ub=document.createElement('div');ub.className='cb-user';ub.textContent=t;msgs.appendChild(ub);
+  appendBotMsg(t,true);
+  supportHistory.push({role:'child',text:t});
   inp.value='';
-  setTimeout(()=>{
-    const bb=document.createElement('div');bb.className='cb-bot';
-    bb.textContent=BOT_REPLIES[botIdx%BOT_REPLIES.length];botIdx++;
-    msgs.appendChild(bb);msgs.scrollTop=msgs.scrollHeight;
-  },900);
-  msgs.scrollTop=msgs.scrollHeight;
+  showBotTyping();
+  socket.emit('support_message',{text:t,history:supportHistory});
 }
 
 usernameInput.focus();

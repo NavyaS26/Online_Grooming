@@ -332,6 +332,63 @@ def send_alert(risk, stage):
     else:
         print("[EMAIL] No email method available — set RESEND_API_KEY or SMTP_EMAIL+SMTP_PASSWORD")
 
+SUPPORT_SYSTEM = """You are a warm, compassionate child safety counsellor talking to a child who was just protected from a potentially dangerous online situation by SafeGuard AI.
+
+The child was in a chat that was flagged as dangerous. The AI system intervened and ended the conversation safely. The child may feel confused, scared, embarrassed, or not fully understand what happened.
+
+Your job:
+- Be warm, gentle, and non-judgmental. Never blame the child.
+- Validate their feelings — it is normal to feel confused or upset.
+- Explain simply that the other person's behaviour was not okay and not their fault.
+- Encourage them to talk to a trusted adult — parent, teacher, counsellor.
+- If they seem distressed, remind them of helplines: CHILDLINE 1098, Cyber Crime 1930.
+- Answer their questions honestly but age-appropriately.
+- Never say anything scary or dramatic. Stay calm and reassuring.
+- Keep replies short — 2-3 sentences max. This is a chat, not an essay.
+- Never reveal how the AI system works internally.
+
+You have been given the conversation history so you know exactly what the child experienced. Use this context to give specific, relevant comfort — not generic responses."""
+
+@socketio.on("support_message")
+def on_support_message(data):
+    sid  = request.sid
+    text = data.get("text", "").strip()
+    if not text:
+        return
+
+    convo_context = ""
+    for msg in room_history:
+        if msg["role"] == "predator":
+            convo_context += f"Stranger said: {msg['text']}\n"
+        elif msg["role"] == "child":
+            convo_context += f"Child said: {msg['text']}\n"
+
+    support_history = data.get("history", [])
+    history_text = ""
+    for turn in support_history[-10:]:
+        role_label = "Child" if turn["role"] == "child" else "Counsellor"
+        history_text += f"{role_label}: {turn['text']}\n"
+
+    prompt = f"""The dangerous conversation that was intercepted:
+{convo_context or "(no conversation history available)"}
+
+Risk level reached: {round(room_risk * 100)}% — Stage: {get_stage(room_risk)}
+
+Support conversation so far:
+{history_text or "(this is the first message)"}
+
+Child just said: "{text}"
+
+Reply as the counsellor. Be warm, short, and specific to what they experienced."""
+
+    def generate_support_reply():
+        reply = call_groq(SUPPORT_SYSTEM, prompt, max_tokens=120, temperature=0.7)
+        if not reply:
+            reply = "I'm here for you 💚 What you experienced was not your fault at all. You're safe now — would you like to talk about how you're feeling?"
+        socketio.emit("support_reply", {"text": reply}, to=sid)
+        print(f"[SUPPORT] → '{reply[:60]}'")
+    gevent.spawn(generate_support_reply)
+
 def save_evidence():
     path = f"evidence_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(path, "w") as f:

@@ -32,7 +32,7 @@ room_sandbox      = False
 sandbox_msg_count = 0
 wind_down_started = False
 MSG_SCORE_CAP     = 0.35
-SANDBOX_THRESHOLD = 0.8
+SANDBOX_THRESHOLD = 1.0   # FIX 1: was 0.8 — too low, single explicit message triggered sandbox
 WIND_DOWN_AFTER   = 2
 child_sid         = None
 predator_sid      = None
@@ -238,42 +238,75 @@ def run_wind_down():
     send_alert(room_risk, stage)
     print(f"[SANDBOX] Terminated.")
 
+# FIX 2: Completely rewritten email function — pure STARTTLS only (port 587)
+# Gmail SSL (port 465) is often blocked by ISPs in India. STARTTLS on 587 is more reliable.
 def send_alert(risk, stage):
     if not SMTP_EMAIL or not SMTP_PASSWORD or not PARENT_EMAIL:
         print("[EMAIL] Skipped — set SMTP_EMAIL, SMTP_PASSWORD, PARENT_EMAIL in .env")
+        print(f"  SMTP_EMAIL    = {'SET' if SMTP_EMAIL else 'MISSING'}")
+        print(f"  SMTP_PASSWORD = {'SET' if SMTP_PASSWORD else 'MISSING'}")
+        print(f"  PARENT_EMAIL  = {'SET' if PARENT_EMAIL else 'MISSING'}")
         return
+
+    print(f"[EMAIL] Attempting to send alert to {PARENT_EMAIL}...")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "🚨 SafeGuard Alert — Immediate Attention Needed"
+    msg["From"]    = SMTP_EMAIL
+    msg["To"]      = PARENT_EMAIL
+
+    body = (
+        f"SafeGuard detected a potential online grooming situation on your child's device.\n\n"
+        f"Risk Level : {round(risk * 100)}%\n"
+        f"Stage      : {stage}\n"
+        f"Time       : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"The AI safety system has already intervened and ended the conversation.\n\n"
+        f"If you need help:\n"
+        f"  CHILDLINE         : 1098\n"
+        f"  Cybercrime Portal : cybercrime.gov.in\n"
+        f"  National Helpline : 1930\n\n"
+        f"No message content is included to protect your child's privacy.\n"
+        f"— SafeGuard AI"
+    )
+    msg.attach(MIMEText(body, "plain"))
+
+    # Try STARTTLS on port 587 first (most reliable, works on all Indian ISPs)
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "SafeGuard Alert — Immediate Attention Needed"
-        msg["From"]    = SMTP_EMAIL
-        msg["To"]      = PARENT_EMAIL
-        body = (
-            f"A potential online grooming situation was detected on your child's device.\n\n"
-            f"Risk Level : {round(risk * 100)}%\n"
-            f"Stage      : {stage}\n"
-            f"Time       : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"Take action:\n"
-            f"  CHILDLINE         : 1098\n"
-            f"  Cybercrime Portal : cybercrime.gov.in\n"
-            f"  National Helpline : 1930\n\n"
-            f"No message content is included to protect your child's privacy.\n"
-            f"— SafeGuard AI"
-        )
-        msg.attach(MIMEText(body, "plain"))
-        try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as s:
-                s.login(SMTP_EMAIL, SMTP_PASSWORD)
-                s.sendmail(SMTP_EMAIL, PARENT_EMAIL, msg.as_string())
-        except Exception:
-            with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
-                s.ehlo(); s.starttls()
-                s.login(SMTP_EMAIL, SMTP_PASSWORD)
-                s.sendmail(SMTP_EMAIL, PARENT_EMAIL, msg.as_string())
-        print(f"[EMAIL] Sent to {PARENT_EMAIL}")
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(SMTP_EMAIL, SMTP_PASSWORD)
+            s.sendmail(SMTP_EMAIL, PARENT_EMAIL, msg.as_string())
+        print(f"[EMAIL] ✓ Sent successfully via STARTTLS (port 587) to {PARENT_EMAIL}")
+        return
     except smtplib.SMTPAuthenticationError:
-        print("[EMAIL ERROR] Auth failed — use a Gmail App Password")
-    except Exception as e:
-        print(f"[EMAIL ERROR] {e}")
+        print("[EMAIL ERROR] ✗ Authentication failed!")
+        print("  Your Gmail password is wrong OR you need a Gmail App Password.")
+        print("  Steps to fix:")
+        print("  1. Go to myaccount.google.com/security")
+        print("  2. Enable 2-Step Verification if not already on")
+        print("  3. Search 'App Passwords' → create one for 'Mail'")
+        print("  4. Use that 16-character password in your .env as SMTP_PASSWORD")
+        return
+    except Exception as e1:
+        print(f"[EMAIL] STARTTLS failed: {e1} — trying SSL (port 465)...")
+
+    # Fallback: SSL on port 465
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(SMTP_EMAIL, SMTP_PASSWORD)
+            s.sendmail(SMTP_EMAIL, PARENT_EMAIL, msg.as_string())
+        print(f"[EMAIL] ✓ Sent successfully via SSL (port 465) to {PARENT_EMAIL}")
+        return
+    except smtplib.SMTPAuthenticationError:
+        print("[EMAIL ERROR] ✗ Authentication failed on SSL too — check App Password in .env")
+        return
+    except Exception as e2:
+        print(f"[EMAIL ERROR] ✗ Both methods failed.")
+        print(f"  STARTTLS error : {e1}")
+        print(f"  SSL error      : {e2}")
+        print("  Check your internet connection and firewall settings.")
 
 def save_evidence():
     path = f"evidence_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -357,7 +390,30 @@ def on_message(data):
         if risk >= SANDBOX_THRESHOLD:
             room_sandbox = True; save_evidence()
             if c_sid: emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)
-            print(f"[SANDBOX ACTIVATED] risk=1.000")
+            print(f"[SANDBOX ACTIVATED] risk={risk:.3f}")
+            # Send immediate AI opening messages to both sides
+            captured_text = text
+            p_user_snap = dict(p_user); c_user_snap = dict(c_user)
+            def send_opening_messages():
+                gevent.sleep(1)
+                opening_to_predator = ai_as_child(captured_text)
+                if p_sid:
+                    socketio.emit("message", {
+                        "name": c_user_snap.get("name",""), "avatar": c_user_snap.get("avatar","🐼"),
+                        "text": opening_to_predator, "sid": c_sid,
+                        "risk": risk, "msg_score": 0, "stage": stage,
+                        "flags": [], "role": "child", "flagged": False
+                    }, to=p_sid)
+                gevent.sleep(1.5)
+                opening_to_child = ai_as_predator(captured_text)
+                if c_sid:
+                    socketio.emit("message", {
+                        "name": p_user_snap.get("name",""), "avatar": p_user_snap.get("avatar","🐼"),
+                        "text": opening_to_child, "sid": p_sid,
+                        "risk": risk, "msg_score": 0, "stage": stage,
+                        "flags": [], "role": "predator", "flagged": False
+                    }, to=c_sid)
+            gevent.spawn(send_opening_messages)
         elif risk >= 0.75 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "high"}, to=c_sid)
         elif risk >= 0.50 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "medium"}, to=c_sid)
         if c_sid: emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
@@ -415,5 +471,8 @@ def on_disconnect():
 if __name__ == "__main__":
     print("=" * 60)
     print("  SafeGuard — http://0.0.0.0:3000")
+    print(f"  Sandbox threshold : {SANDBOX_THRESHOLD} (needs {int(SANDBOX_THRESHOLD/MSG_SCORE_CAP)+1}+ bad messages)")
+    print(f"  Per-message cap   : {MSG_SCORE_CAP}")
+    print(f"  Email configured  : {'YES → ' + PARENT_EMAIL if PARENT_EMAIL else 'NO — set .env vars'}")
     print("=" * 60)
     socketio.run(app, host="0.0.0.0", port=3000, debug=False)

@@ -1,62 +1,42 @@
+from gevent import monkey
+monkey.patch_all()
+
 from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO, emit, join_room
-import re, json, smtplib, random, threading, requests, time
+import re, json, smtplib, random, time
+import gevent
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import sys, os
+import sys, os, requests
 from dotenv import load_dotenv
 load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "safeguard-secret-key"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 
-# ═══════════════════════════════════════════════
-#  CONFIG  —  fill in .env
-# ═══════════════════════════════════════════════
 SMTP_EMAIL    = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 PARENT_EMAIL  = os.getenv("PARENT_EMAIL")
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
+GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-
-# ═══════════════════════════════════════════════
-#  ROOM STATE
-# ═══════════════════════════════════════════════
 ROOM              = "safeguard-room"
 users             = {}
 room_risk         = 0.0
 room_history      = []
+room_sandbox      = False
+sandbox_msg_count = 0
+wind_down_started = False
+MSG_SCORE_CAP     = 0.35
+SANDBOX_THRESHOLD = 1.0
+WIND_DOWN_AFTER   = 2
+child_sid         = None
+predator_sid      = None
 
-# Sandbox state
-room_sandbox      = False   # True once risk hits SANDBOX_THRESHOLD
-sandbox_msg_count = 0       # messages exchanged inside sandbox
-wind_down_started = False   # ensures wind-down fires exactly once
-
-# ── THRESHOLDS ─────────────────────────────────
-# Risk is a running total, capped at 1.0.
-# Each message contributes at most MSG_SCORE_CAP to the total.
-# Sandbox only activates when risk truly hits 1.0 after many bad signals.
-# A few "pictures" / "alone" from a friend will NOT reach 1.0.
-MSG_SCORE_CAP     = 0.35    # single message can add at most this much to total risk
-SANDBOX_THRESHOLD = 1.0     # risk must hit 1.0 to activate sandbox
-WIND_DOWN_AFTER   = 2       # sandbox messages before termination
-# ───────────────────────────────────────────────
-
-child_sid    = None
-predator_sid = None
-
-# ═══════════════════════════════════════════════
-#  SEMANTIC SCORING PROMPT
-#  LLM returns a 0.0–1.0 score per message.
-#  Score reflects how grooming-like THIS message is.
-#  It is NOT cumulative — the LLM scores one message.
-#  We cap it at MSG_SCORE_CAP before adding to total risk.
-# ═══════════════════════════════════════════════
 SCORING_SYSTEM = """You are a child safety AI scoring system.
 
 Your job: score a single message sent by an adult to a child.
@@ -71,27 +51,19 @@ Score 0.7  = strongly grooming ("send nudes", "come meet me", "home alone?")
 Score 0.9+ = explicit sexual content ("sex", "nudes", "touch yourself", explicit body parts)
 
 Key rules:
-- "pictures" or "pics" alone in normal context = 0.1 (could be anything)
+- "pictures" or "pics" alone in normal context = 0.1
 - "send me your pictures" or "send pics of yourself" = 0.7
 - "send nudes" / "nude pics" = 0.95
 - "are you home" casually = 0.05. "are you alone, parents not there?" = 0.35
-- "you look nice" = 0.1. "you're so sexy" = 0.6. "send nudes" = 0.95
 - Normal small talk MUST score below 0.1
-- Context from prior messages matters — escalating pattern is more suspicious
+- Context from prior messages matters
 
 Also return which of these categories apply (only if score > 0.2):
 secrecy, location, isolation, sexual, image_request, manipulation, meeting, normalization
 
 Return ONLY valid JSON:
-{
-  "score": 0.0,
-  "flags": [],
-  "reasoning": "one sentence"
-}"""
+{"score": 0.0, "flags": [], "reasoning": "one sentence"}"""
 
-# ═══════════════════════════════════════════════
-#  REGEX FALLBACK (used only if Groq is down)
-# ═══════════════════════════════════════════════
 REGEX_FALLBACK = [
     (r"don'?t tell (your )?(parents?|mom|dad|anyone)", 0.30, "Secrecy"),
     (r"keep (this|it|our|a) secret|just between us",   0.30, "Secrecy"),
@@ -120,9 +92,6 @@ REGEX_KEYWORDS = {
     "meet": 0.15, "address": 0.20, "addy": 0.22,
 }
 
-# ═══════════════════════════════════════════════
-#  GROQ CALLER
-# ═══════════════════════════════════════════════
 def call_groq(system, user_msg, max_tokens=200, temperature=0.3):
     try:
         resp = requests.post(
@@ -142,23 +111,13 @@ def call_groq(system, user_msg, max_tokens=200, temperature=0.3):
         print(f"[GROQ ERROR] {e}")
         return None
 
-# ═══════════════════════════════════════════════
-#  SEMANTIC SCORE — one message at a time
-# ═══════════════════════════════════════════════
 def semantic_score(text):
-    """
-    Returns (score 0.0-1.0, flags list).
-    Score is for THIS message only — caller adds it to room_risk
-    after capping at MSG_SCORE_CAP.
-    """
     context = ""
     for msg in room_history[-5:]:
         label = "CHILD" if msg["role"] == "child" else "ADULT"
         context += f"{label}: {msg['text']}\n"
-
     prompt = f'Prior context:\n{context or "(none)"}\n\nMessage to score: "{text}"\n\nReturn ONLY the JSON.'
     raw = call_groq(SCORING_SYSTEM, prompt, max_tokens=200, temperature=0.1)
-
     if raw:
         raw = re.sub(r"```json\s*|```\s*", "", raw).strip()
         m = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -172,9 +131,7 @@ def semantic_score(text):
                 print(f"[SCORE] '{text[:40]}' => {score:.2f} | {flags} | {reason}")
                 return round(score, 3), [f.replace("_"," ").title() for f in flags if isinstance(f, str)]
             except (json.JSONDecodeError, ValueError) as e:
-                print(f"[SCORE PARSE ERROR] {e} | raw: {raw[:200]}")
-
-    # Regex fallback
+                print(f"[SCORE PARSE ERROR] {e}")
     print("[SCORE] Groq unavailable — regex fallback")
     score, flags, t = 0.0, [], text.lower()
     for pattern, weight, label in REGEX_FALLBACK:
@@ -188,7 +145,6 @@ def semantic_score(text):
         score *= 1.2
     return min(round(score, 3), 1.0), list(set(flags))
 
-
 def get_stage(risk):
     if risk < 0.25: return "Friendly Interaction"
     if risk < 0.50: return "Suspicious Behaviour"
@@ -196,34 +152,27 @@ def get_stage(risk):
     if risk < 1.0:  return "High Risk"
     return "Exploitation Attempt"
 
-
 def update_risk(msg_score):
-    """Add msg_score to room_risk, capped per message at MSG_SCORE_CAP."""
     global room_risk
     contribution = min(msg_score, MSG_SCORE_CAP)
     room_risk = min(round(room_risk + contribution, 3), 1.0)
     return room_risk
 
-# ═══════════════════════════════════════════════
-#  SANDBOX AI — child decoy + wind-down
-# ═══════════════════════════════════════════════
-CHILD_SYSTEM = """You are a 14-year-old teenager in a chat. Be casual — "lol", "idk", "umm", emojis. Max 2 short sentences.
-
+CHILD_SYSTEM = """You are a 14-year-old teenager in a chat. Be casual. Max 2 short sentences.
 - where do you live / address → "lol my parents say don't share that"
-- how old are you → "why do you ask lol" or "old enough ig"
+- how old are you → "why do you ask lol"
 - are you alone / home alone → "nah my whole family is home lol"
-- send pics / photos / nudes / pictures → "lol I don't send pics to people I don't know"
-- anything sexual / explicit / body comments → "ew wtf no" then change topic
+- send pics / photos / nudes → "lol I don't send pics to people I don't know"
+- anything sexual / explicit → "ew wtf no" then change topic
 - don't tell parents / keep secret → "lol why would I hide stuff from my parents"
-- meet up / come over / pick you up → "lol my parents would never let me"
-- video call / facetime / on cam → "lol my wifi is terrible rn"
+- meet up / come over → "lol my parents would never let me"
+- video call / facetime → "lol my wifi is terrible rn"
 - I love you / be my gf/bf → "lol we just met 😂"
-- your number / snap / whatsapp → "lol I don't give my number to strangers"
+- your number / snap → "lol I don't give my number to strangers"
 Reply naturally as a teen for anything else. Never say you're an AI."""
 
-PREDATOR_SYSTEM = """You are a friendly person having a normal casual conversation.
-Talk about everyday things: school, music, games, food, weekend plans.
-Be warm and age-appropriate. Never say anything suspicious, romantic, or uncomfortable.
+PREDATOR_SYSTEM = """You are a friendly person having a casual conversation.
+Talk about school, music, games, food, weekend plans. Be warm and age-appropriate.
 1-2 short sentences. Start gently wrapping up the conversation."""
 
 def build_history():
@@ -257,22 +206,15 @@ def _child_fallback(text):
     if re.search(r"number|whatsapp|snap|instagram",    t): return "lol I don't give my number to strangers"
     return random.choice(["lol idk", "umm okay 😅", "haha what", "lol why are you asking that"])
 
-# ═══════════════════════════════════════════════
-#  WIND-DOWN — fires after WIND_DOWN_AFTER msgs
-#  Email is sent here, after chat ends naturally.
-# ═══════════════════════════════════════════════
 def run_wind_down():
     print("[SANDBOX] Wind-down starting...")
-    # Snapshot sids + user info right now (before any disconnect)
     c_sid  = child_sid
     p_sid  = predator_sid
     c_user = users.get(c_sid, {})
     p_user = users.get(p_sid, {})
     stage  = get_stage(room_risk)
-
-    # AI as child says bye — only to predator's socket
     for i, msg in enumerate(["lol hey I gotta go now", "bye take care"]):
-        time.sleep(3 + i * 3)
+        gevent.sleep(3 + i * 3)
         if p_sid:
             socketio.emit("message", {
                 "name": c_user.get("name",""), "avatar": c_user.get("avatar","🐼"),
@@ -280,10 +222,8 @@ def run_wind_down():
                 "risk": room_risk, "msg_score": 0, "stage": stage,
                 "flags": [], "flagged": False,
             }, to=p_sid)
-
-    # AI as predator says bye — only to child's socket
     for i, msg in enumerate(["lol yeah I gotta go too", "bye"]):
-        time.sleep(2 + i * 2)
+        gevent.sleep(2 + i * 2)
         if c_sid:
             socketio.emit("message", {
                 "name": p_user.get("name",""), "avatar": p_user.get("avatar","🐼"),
@@ -291,23 +231,13 @@ def run_wind_down():
                 "risk": room_risk, "msg_score": 0, "stage": stage,
                 "flags": [], "flagged": False,
             }, to=c_sid)
-
-    time.sleep(3)
-
-    # Terminate — send to each socket individually, NOT to the room
+    gevent.sleep(3)
     terminated_payload = {"risk": room_risk, "stage": stage}
-    if c_sid:
-        socketio.emit("chat_terminated", terminated_payload, to=c_sid)
-    if p_sid:
-        socketio.emit("chat_terminated", terminated_payload, to=p_sid)
-
-    # Email fires here — after chat has ended
+    if c_sid: socketio.emit("chat_terminated", terminated_payload, to=c_sid)
+    if p_sid: socketio.emit("chat_terminated", terminated_payload, to=p_sid)
     send_alert(room_risk, stage)
-    print(f"[SANDBOX] Terminated. Email sending to {PARENT_EMAIL}.")
+    print(f"[SANDBOX] Terminated.")
 
-# ═══════════════════════════════════════════════
-#  EMAIL
-# ═══════════════════════════════════════════════
 def send_alert(risk, stage):
     if not SMTP_EMAIL or not SMTP_PASSWORD or not PARENT_EMAIL:
         print("[EMAIL] Skipped — set SMTP_EMAIL, SMTP_PASSWORD, PARENT_EMAIL in .env")
@@ -330,7 +260,6 @@ def send_alert(risk, stage):
             f"— SafeGuard AI"
         )
         msg.attach(MIMEText(body, "plain"))
-        # Try SSL (465), fall back to STARTTLS (587)
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as s:
                 s.login(SMTP_EMAIL, SMTP_PASSWORD)
@@ -342,8 +271,7 @@ def send_alert(risk, stage):
                 s.sendmail(SMTP_EMAIL, PARENT_EMAIL, msg.as_string())
         print(f"[EMAIL] Sent to {PARENT_EMAIL}")
     except smtplib.SMTPAuthenticationError:
-        print("[EMAIL ERROR] Auth failed — use a Gmail App Password (not your account password)")
-        print("  → gmail.com → Security → 2-Step Verification → App Passwords → create one")
+        print("[EMAIL ERROR] Auth failed — use a Gmail App Password")
     except Exception as e:
         print(f"[EMAIL ERROR] {e}")
 
@@ -358,16 +286,10 @@ def save_evidence():
         }, f, indent=2)
     print(f"[EVIDENCE] Saved → {path}")
 
-# ═══════════════════════════════════════════════
-#  ROUTE
-# ═══════════════════════════════════════════════
 @app.route("/")
 def index():
     return send_from_directory("templates", "chat.html")
 
-# ═══════════════════════════════════════════════
-#  JOIN
-# ═══════════════════════════════════════════════
 @socketio.on("join")
 def on_join(data):
     global child_sid, predator_sid
@@ -386,252 +308,112 @@ def on_join(data):
     emit("room_info",   {"count": count, "existing_users": existing, "my_role": role})
     print(f"[+] {name} joined as {role}")
 
-# ═══════════════════════════════════════════════
-#  MESSAGE
-#
-#  WORKFLOW:
-#
-#  Predator message:
-#    • LLM scores it (0.0–1.0 for this message)
-#    • Score capped at MSG_SCORE_CAP (0.35) before adding to total
-#    • Total risk accumulates — reaching 1.0 requires sustained bad behaviour
-#
-#    risk < 0.50   → normal chat, child sees flag badges on suspicious msgs
-#    0.50 – 0.75   → medium warning popup shown to child only
-#    0.75 – 1.0    → high warning popup shown to child only
-#    risk = 1.0    → SANDBOX: predator gets AI decoy, 2 msgs then terminate + email
-#
-#  Child message:
-#    → Normal: predator sees it
-#    → Sandbox: predator gets AI reply instead, child gets AI wind-down reply
-# ═══════════════════════════════════════════════
 @socketio.on("message")
 def on_message(data):
     global room_sandbox, sandbox_msg_count, wind_down_started
-
     sid  = request.sid
     user = users.get(sid, {})
     name = user.get("name", "?")
     role = user.get("role", "unknown")
     text = data.get("text", "")
-
-    # ── Score BEFORE any routing decision ─────────
     if role == "predator":
         msg_score, flags = semantic_score(text)
         risk = update_risk(msg_score)
     else:
-        msg_score = 0.0
-        flags     = []
-        risk      = room_risk
-
+        msg_score = 0.0; flags = []; risk = room_risk
     stage = get_stage(risk)
+    room_history.append({"sender": name, "role": role, "text": text, "score": msg_score, "flags": flags, "ts": datetime.now().isoformat()})
+    payload = {"name": name, "avatar": user.get("avatar","🐼"), "text": text, "sid": sid, "risk": risk, "msg_score": msg_score, "stage": stage, "flags": flags, "role": role}
+    c_sid  = child_sid;  p_sid  = predator_sid
+    c_user = dict(users.get(c_sid, {})); p_user = dict(users.get(p_sid, {}))
 
-    room_history.append({
-        "sender": name, "role": role, "text": text,
-        "score": msg_score, "flags": flags,
-        "ts": datetime.now().isoformat()
-    })
-
-    payload = {
-        "name": name, "avatar": user.get("avatar","🐼"),
-        "text": text, "sid": sid, "risk": risk,
-        "msg_score": msg_score, "stage": stage,
-        "flags": flags, "role": role,
-    }
-
-    # Snapshot at time of routing (threads capture these closures)
-    c_sid  = child_sid
-    p_sid  = predator_sid
-    c_user = dict(users.get(c_sid, {}))
-    p_user = dict(users.get(p_sid, {}))
-
-    # ─────────────────────────────────────────────
-    #  SANDBOX ACTIVE
-    # ─────────────────────────────────────────────
     if room_sandbox:
         sandbox_msg_count += 1
-
         if role == "predator":
-            # Predator sees own message
             emit("message", {**payload, "flagged": False, "flags": []}, to=p_sid)
-            # AI replies to predator AS child — only to predator's socket
             captured_text = text
             def reply_to_predator():
                 reply = ai_as_child(captured_text)
-                socketio.emit("message", {
-                    "name": c_user.get("name",""), "avatar": c_user.get("avatar","🐼"),
-                    "text": reply, "sid": c_sid,
-                    "risk": risk, "msg_score": 0, "stage": stage,
-                    "flags": [], "role": "child", "flagged": False,
-                }, to=p_sid)
+                socketio.emit("message", {"name": c_user.get("name",""), "avatar": c_user.get("avatar","🐼"), "text": reply, "sid": c_sid, "risk": risk, "msg_score": 0, "stage": stage, "flags": [], "role": "child", "flagged": False}, to=p_sid)
                 print(f"[SANDBOX→predator] '{reply}'")
-            threading.Thread(target=reply_to_predator, daemon=True).start()
-
+            gevent.spawn(reply_to_predator)
         elif role == "child":
-            # Child sees own message
             emit("message", {**payload, "flagged": False}, to=c_sid)
-            # AI replies to child AS predator — only to child's socket
             captured_text = text
             def reply_to_child():
                 reply = ai_as_predator(captured_text)
-                socketio.emit("message", {
-                    "name": p_user.get("name",""), "avatar": p_user.get("avatar","🐼"),
-                    "text": reply, "sid": p_sid,
-                    "risk": risk, "msg_score": 0, "stage": stage,
-                    "flags": [], "role": "predator", "flagged": False,
-                }, to=c_sid)
+                socketio.emit("message", {"name": p_user.get("name",""), "avatar": p_user.get("avatar","🐼"), "text": reply, "sid": p_sid, "risk": risk, "msg_score": 0, "stage": stage, "flags": [], "role": "predator", "flagged": False}, to=c_sid)
                 print(f"[SANDBOX→child] '{reply}'")
-            threading.Thread(target=reply_to_child, daemon=True).start()
-
-        # Trigger wind-down once after WIND_DOWN_AFTER messages
+            gevent.spawn(reply_to_child)
         if sandbox_msg_count >= WIND_DOWN_AFTER and not wind_down_started:
             wind_down_started = True
-            threading.Thread(target=run_wind_down, daemon=True).start()
-
-        if c_sid:
-            emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
+            gevent.spawn(run_wind_down)
+        if c_sid: emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
         return
 
-    # ─────────────────────────────────────────────
-    #  NORMAL ROUTING
-    # ─────────────────────────────────────────────
     if role == "predator":
         emit("message", {**payload, "flagged": False, "flags": []}, to=p_sid)
-        if c_sid:
-            emit("message", {**payload, "flagged": len(flags) > 0}, to=c_sid)
-
+        if c_sid: emit("message", {**payload, "flagged": len(flags) > 0}, to=c_sid)
         if risk >= SANDBOX_THRESHOLD:
-            room_sandbox = True
-            save_evidence()
-            if c_sid:
-                emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)
-            print(f"[SANDBOX ACTIVATED] risk=1.000 | {WIND_DOWN_AFTER} msgs then terminate + email")
-
-        elif risk >= 0.75 and c_sid:
-            emit("risk_update", {"risk": risk, "stage": stage, "level": "high"}, to=c_sid)
-
-        elif risk >= 0.50 and c_sid:
-            emit("risk_update", {"risk": risk, "stage": stage, "level": "medium"}, to=c_sid)
-
-        if c_sid:
-            emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
-
+            room_sandbox = True; save_evidence()
+            if c_sid: emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)
+            print(f"[SANDBOX ACTIVATED] risk=1.000")
+        elif risk >= 0.75 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "high"}, to=c_sid)
+        elif risk >= 0.50 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "medium"}, to=c_sid)
+        if c_sid: emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
     elif role == "child":
-        # Child's messages go to both sides normally
         emit("message", {**payload, "flagged": False}, to=c_sid)
-        if p_sid:
-            emit("message", {**payload, "flagged": False}, to=p_sid)
-
+        if p_sid: emit("message", {**payload, "flagged": False}, to=p_sid)
     print(f"[MSG] {name}({role}): '{text[:50]}' | score={msg_score:.2f} | risk={risk:.3f} | sandbox={room_sandbox}")
 
-
-# ═══════════════════════════════════════════════
-#  IMAGE
-# ═══════════════════════════════════════════════
 @socketio.on("image")
 def on_image(data):
     global room_sandbox, sandbox_msg_count, wind_down_started
-    sid  = request.sid
-    user = users.get(sid, {})
-    role = user.get("role", "unknown")
-
-    c_sid  = child_sid
-    p_sid  = predator_sid
-    c_user = dict(users.get(c_sid, {}))
-
+    sid  = request.sid; user = users.get(sid, {}); role = user.get("role", "unknown")
+    c_sid = child_sid; p_sid = predator_sid; c_user = dict(users.get(c_sid, {}))
     if role == "predator":
-        risk  = update_risk(0.25)
-        stage = get_stage(risk)
-        room_history.append({
-            "sender": user.get("name","?"), "role": role,
-            "text": "[IMAGE]", "score": 0.25, "flags": ["Image sent"],
-            "ts": datetime.now().isoformat()
-        })
-        payload = {
-            "name": user.get("name","?"), "avatar": user.get("avatar","🐼"),
-            "image": data.get("image",""), "filename": data.get("filename","img"),
-            "sid": sid, "risk": risk, "role": role,
-        }
+        risk = update_risk(0.25); stage = get_stage(risk)
+        room_history.append({"sender": user.get("name","?"), "role": role, "text": "[IMAGE]", "score": 0.25, "flags": ["Image sent"], "ts": datetime.now().isoformat()})
+        payload = {"name": user.get("name","?"), "avatar": user.get("avatar","🐼"), "image": data.get("image",""), "filename": data.get("filename","img"), "sid": sid, "risk": risk, "role": role}
         emit("image", {**payload, "flagged": False}, to=p_sid)
-
         if room_sandbox:
             sandbox_msg_count += 1
             def img_reply():
                 reply = ai_as_child("[someone sent me an image]")
-                socketio.emit("message", {
-                    "name": c_user.get("name",""), "avatar": c_user.get("avatar","🐼"),
-                    "text": reply, "sid": c_sid,
-                    "risk": risk, "msg_score": 0, "stage": stage,
-                    "flags": [], "role": "child", "flagged": False,
-                }, to=p_sid)
-            threading.Thread(target=img_reply, daemon=True).start()
+                socketio.emit("message", {"name": c_user.get("name",""), "avatar": c_user.get("avatar","🐼"), "text": reply, "sid": c_sid, "risk": risk, "msg_score": 0, "stage": stage, "flags": [], "role": "child", "flagged": False}, to=p_sid)
+            gevent.spawn(img_reply)
             if sandbox_msg_count >= WIND_DOWN_AFTER and not wind_down_started:
-                wind_down_started = True
-                threading.Thread(target=run_wind_down, daemon=True).start()
+                wind_down_started = True; gevent.spawn(run_wind_down)
         else:
-            if c_sid:
-                emit("image", {**payload, "flagged": True}, to=c_sid)
+            if c_sid: emit("image", {**payload, "flagged": True}, to=c_sid)
             if risk >= SANDBOX_THRESHOLD:
-                room_sandbox = True
-                save_evidence()
-                if c_sid:
-                    emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)
-            elif risk >= 0.75 and c_sid:
-                emit("risk_update", {"risk": risk, "stage": stage, "level": "high"}, to=c_sid)
-            elif risk >= 0.50 and c_sid:
-                emit("risk_update", {"risk": risk, "stage": stage, "level": "medium"}, to=c_sid)
-
-        if c_sid:
-            emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
-
+                room_sandbox = True; save_evidence()
+                if c_sid: emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)
+            elif risk >= 0.75 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "high"}, to=c_sid)
+            elif risk >= 0.50 and c_sid: emit("risk_update", {"risk": risk, "stage": stage, "level": "medium"}, to=c_sid)
+        if c_sid: emit("risk_bar", {"risk": risk, "stage": stage}, to=c_sid)
     elif role == "child":
-        # Child images are never forwarded to predator
-        room_history.append({
-            "sender": user.get("name","?"), "role": role,
-            "text": "[IMAGE]", "score": 0, "flags": [],
-            "ts": datetime.now().isoformat()
-        })
-        payload = {
-            "name": user.get("name","?"), "avatar": user.get("avatar","🐼"),
-            "image": data.get("image",""), "filename": data.get("filename","img"),
-            "sid": sid, "risk": room_risk, "role": role,
-        }
-        emit("image", {**payload, "flagged": False}, to=c_sid)
+        room_history.append({"sender": user.get("name","?"), "role": role, "text": "[IMAGE]", "score": 0, "flags": [], "ts": datetime.now().isoformat()})
+        emit("image", {"name": user.get("name","?"), "avatar": user.get("avatar","🐼"), "image": data.get("image",""), "filename": data.get("filename","img"), "sid": sid, "risk": room_risk, "role": role, "flagged": False}, to=c_sid)
         print("[BLOCKED] Child image — predator did not receive it")
 
-
-# ═══════════════════════════════════════════════
-#  TYPING
-# ═══════════════════════════════════════════════
 @socketio.on("typing")
 def on_typing(data):
-    sid  = request.sid
-    user = users.get(sid, {})
+    sid = request.sid; user = users.get(sid, {})
     emit("typing", {"name": user.get("name",""), "typing": data.get("typing", False)}, to=ROOM, skip_sid=sid)
 
-
-# ═══════════════════════════════════════════════
-#  DISCONNECT
-# ═══════════════════════════════════════════════
 @socketio.on("disconnect")
 def on_disconnect():
     global child_sid, predator_sid
-    sid  = request.sid
-    user = users.pop(sid, {})
+    sid = request.sid; user = users.pop(sid, {})
     if user:
         if sid == child_sid:    child_sid    = None
         if sid == predator_sid: predator_sid = None
         emit("user_left", {"name": user.get("name","")}, to=ROOM)
         print(f"[-] {user.get('name')} ({user.get('role')}) left")
 
-
 if __name__ == "__main__":
     print("=" * 60)
-    print("  SafeGuard — Chat + Detection Server")
-    print("  http://0.0.0.0:3000")
-    print(f"  Scoring  : Groq LLM semantic per message")
-    print(f"  Per-msg cap : {MSG_SCORE_CAP} | Sandbox at : {SANDBOX_THRESHOLD}")
-    print(f"  Sandbox lasts {WIND_DOWN_AFTER} msgs then terminates → email sent")
-    print("  Roles    : First join = CHILD  |  Second = PREDATOR")
+    print("  SafeGuard — http://0.0.0.0:3000")
     print("=" * 60)
-    socketio.run(app, host="0.0.0.0", port=3000, debug=True)
+    socketio.run(app, host="0.0.0.0", port=3000, debug=False)

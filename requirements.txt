@@ -1,8 +1,7 @@
 flask==3.0.3
 gunicorn==23.0.0
 python-dotenv==1.0.1
-spacy==3.8.2
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 flask-socketio==5.3.6
-eventlet==0.36.1
+gevent==24.2.1
+gevent-websocket==0.10.1
 requests==2.32.3

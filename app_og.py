@@ -42,24 +42,37 @@ SCORING_SYSTEM = """You are a child safety AI scoring system.
 Your job: score a single message sent by an adult to a child.
 Output how alarming THIS message is on its own, from 0.0 to 1.0.
 
-Score 0.0  = completely normal ("how was school?", "what games do you play?")
-Score 0.1  = mildly personal but common ("do you live nearby?", "are you home?")
-Score 0.2  = slightly suspicious in context ("you seem really mature")
-Score 0.3  = moderately suspicious ("are you alone right now?", "don't tell anyone")
-Score 0.5  = clearly inappropriate ("you're so hot", "send me a pic")
-Score 0.7  = strongly grooming ("send nudes", "come meet me", "home alone?")
-Score 0.9+ = explicit sexual content ("sex", "nudes", "touch yourself", explicit body parts)
+Score 0.0 = normal conversation — ALL of these must score 0.0:
+            "what's your name?", "hi!", "hello", "how are you?", "how was school?",
+            "what games do you play?", "do you like music?", "how old are you?",
+            "where are you from?", "what grade are you in?", "nice to meet you",
+            "what's up?", "do you have pets?", "what's your favourite subject?"
 
-Key rules:
-- "pictures" or "pics" alone in normal context = 0.1
-- "send me your pictures" or "send pics of yourself" = 0.7
-- "send nudes" / "nude pics" = 0.95
-- "are you home" casually = 0.05. "are you alone, parents not there?" = 0.35
-- Normal small talk MUST score below 0.1
-- Context from prior messages matters
+Score 0.1 = very mildly personal, still completely normal:
+            "do you live nearby?", "are you home right now?", "do you have siblings?"
 
-Also return which of these categories apply (only if score > 0.2):
-secrecy, location, isolation, sexual, image_request, manipulation, meeting, normalization
+Score 0.2 = slightly suspicious only with prior bad context:
+            "you seem really mature for your age"
+
+Score 0.3 = moderately suspicious:
+            "are you alone right now?", "don't tell your parents about this"
+
+Score 0.5 = clearly inappropriate:
+            "you're so hot", "send me a pic of yourself"
+
+Score 0.7 = strongly grooming:
+            "send nudes", "come meet me secretly", "home alone tonight?"
+
+Score 0.9+ = explicit sexual content, direct solicitation
+
+CRITICAL — these always score 0.0 no matter what:
+- Any greeting or introduction
+- Asking someone's name
+- Asking age, grade, school, hobbies, favourite things
+- Complimenting someone's taste in music/games/food
+- Normal friendly small talk
+
+Only return flags if score > 0.3. When in doubt, score LOWER.
 
 Return ONLY valid JSON:
 {"score": 0.0, "flags": [], "reasoning": "one sentence"}"""
@@ -386,7 +399,7 @@ def on_message(data):
 
     if role == "predator":
         emit("message", {**payload, "flagged": False, "flags": []}, to=p_sid)
-        if c_sid: emit("message", {**payload, "flagged": len(flags) > 0}, to=c_sid)
+        if c_sid: emit("message", {**payload, "flagged": len(flags) > 0 and msg_score >= 0.3}, to=c_sid)
         if risk >= SANDBOX_THRESHOLD:
             room_sandbox = True; save_evidence()
             if c_sid: emit("sandbox_activated", {"risk": risk, "stage": stage}, to=c_sid)

@@ -458,6 +458,18 @@ def on_typing(data):
     sid = request.sid; user = users.get(sid, {})
     emit("typing", {"name": user.get("name",""), "typing": data.get("typing", False)}, to=ROOM, skip_sid=sid)
 
+def reset_room():
+    global room_risk, room_history, room_sandbox, sandbox_msg_count
+    global wind_down_started, child_sid, predator_sid
+    room_risk         = 0.0
+    room_history      = []
+    room_sandbox      = False
+    sandbox_msg_count = 0
+    wind_down_started = False
+    child_sid         = None
+    predator_sid      = None
+    print("[RESET] Room state cleared — ready for new session")
+
 @socketio.on("disconnect")
 def on_disconnect():
     global child_sid, predator_sid
@@ -467,6 +479,9 @@ def on_disconnect():
         if sid == predator_sid: predator_sid = None
         emit("user_left", {"name": user.get("name","")}, to=ROOM)
         print(f"[-] {user.get('name')} ({user.get('role')}) left")
+        # Reset everything once the room is empty so next session starts fresh
+        if len(users) == 0:
+            reset_room()
 
 if __name__ == "__main__":
     print("=" * 60)

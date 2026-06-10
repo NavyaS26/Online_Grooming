@@ -3,7 +3,19 @@
 A real-time AI-powered child grooming detection and intervention system that monitors online conversations, identifies grooming behaviour using a fine-tuned DistilBERT classifier and LLaMA 3.3-70B, and protects children by automatically intercepting dangerous conversations before exploitation can occur.
 
 ---
+## 🌐 Live Demo
 
+https://online-grooming.onrender.com
+
+### Demo Instructions
+
+1. Open the application in two browser windows.
+2. Use one window as the child and the other as the adult.
+3. Start a conversation between the two users.
+4. Observe the live grooming risk score and warning indicators.
+5. Continue the conversation until the intervention threshold is reached.
+6. Watch the AI Sandbox activate and intercept the conversation.
+7. Observe parent alerts, evidence capture, and automated conversation termination.
 ## What It Does
 
 * Monitors conversations in real time and evaluates each incoming message for grooming risk
